@@ -33,4 +33,4 @@ displays working should one of them take damage during match play. Only one outp
 same number of pixels.
 <p />
 
-Details about the implementation, controls, and options may be found in the comments integrated in the "Settings" section at the top of the code. Please read there for more information.
+Details about the implementation, controls, and options may be found in the comments integrated in the "Details & Settings" section at the top of the code. Please read there for more information.
