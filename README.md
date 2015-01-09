@@ -1,4 +1,4 @@
-# FRC_Status_LEDs
+# FRC Status LEDs
 Code to be used with a RioDuino and WS2812 LEDs to provide visual feedback to the driver of an FRC robot
 <hr>
 This program is designed to take single characters from a serial input
