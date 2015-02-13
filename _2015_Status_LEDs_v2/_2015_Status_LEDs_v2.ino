@@ -80,9 +80,9 @@
 #define STARTCOLOR 0x00FFFF // Color to have all LEDs lit to upon boot (if set in STARTWITHSHOW) (default: Cyan)
 
 #define BRIGHTNESS 100 // Global brightness percentage (a lower the value is better on your battery but potentially harder to see)
-#define SECTIONS 3 // How many status display sections will be shown when not in initial display mode
+#define SECTIONS 3 // How many status display sections will be shown when not in initial display mode (max acceptable value is 7)
 
-#define DIVIDERS 0 // Have white divider LEDs between status display sections? 1=yes, 0=no
+#define DIVIDERS 0 // Have white divider LEDs between status display sections? Only acceptable values: 1=yes, 0=no
 #define DIVIDERCOLOR 0x888888 // Color of the divider LEDs (default: mid brightness white)
 
 
@@ -93,7 +93,7 @@
 
 // Set parameters for the input types here as needed
 #define UART_SPEED 115200   // Ignored if UART input isn't used
-#define I2C_SLAVE_ADDR 0x10 // Ignored if I2C input isn't used
+#define I2C_SLAVE_ADDR 0x11 // Ignored if I2C input isn't used
 
 // Tell me about your WS2812 light strip
 #define NPIXEL 10  // How many pixels on the LED strip
@@ -106,6 +106,13 @@
 // 1=Cylon Eye effect going up and down the string
 // 2=Cylon Eye effect going only one direction, then wrapping back to the start of the string
 // 3=Breathing effect using brightness increase/decrease and a single color
+// Solid color
+// Zip Up-Down
+// Zip Follow
+// Rainbow Chase
+// Theatre Chase
+// Flashing
+// Gradient from pre-defined gradients
 #define IDLESHOW 1
 
 // Things that control the look of the Cylon Eye effects (ignored if Cylon effects not used)
@@ -132,90 +139,145 @@
 /////////////////////////////////////////////////////////////////////////////////////
 
 
-#include <Adafruit_NeoPixel.h>
 #ifdef I2C
 #include <Wire.h>
 #endif
+
+// Effects variables and macros
 #define CHECK_BIT(var,pos) ((var) & (1<<(pos)))
 #define TOGGLE_BIT(var,pos) ((var) ^ (1<<(pos)))
-#define FLASHTYPES 3
+#define SET_BIT(var,pos) ((var) | (1<<(pos)))
+#define EFFECTS_COUNT 16
+#define MAXSECTIONS 8
 
-Adafruit_NeoPixel strip = Adafruit_NeoPixel(NPIXEL, LED_PIN, NEO_GRB + NEO_KHZ800);
-boolean dropInitDisplay=0;
-byte sectionFlash[SECTIONS];
-uint32_t sectionColor[SECTIONS];
-unsigned int sectionStart[SECTIONS];
-unsigned int sectionEnd[SECTIONS];
+boolean dropInitEffect=0;
+byte sectionEffect[MAXSECTIONS];
+int sectionEffectState[MAXSECTIONS];
+unsigned long lastEffectStep[MAXSECTIONS];
+uint32_t sectionColor[MAXSECTIONS];
+
+// General execution variables
+unsigned int sectionStart[MAXSECTIONS];
+unsigned int sectionEnd[MAXSECTIONS];
 unsigned int sectionLength=(NPIXEL / SECTIONS);
-unsigned long lastFlashCheck[FLASHTYPES+1][SECTIONS];
+
+#include <Adafruit_NeoPixel.h>
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(NPIXEL, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 void setup() {
+  sectionStart[MAXSECTIONS-1]=0; // The highest section number always addresses the whole strip
+  sectionEnd[MAXSECTIONS-1]=NPIXEL; // The highest section number always addresses the whole strip
 #ifdef UART
   Serial.begin(UART_SPEED);
 #endif
 #ifdef I2C
   Wire.begin(I2C_SLAVE_ADDR);
-  Wire.onReceive(receiveEvent); // register event
+  Wire.onReceive(receiveI2cEvent); // register event handler
 #endif
+// Initialize the values defining each section
+// MAC: low-priority: figure out if this can be done with constants/pre-compile code
   for(int i=0; i < SECTIONS; i++) {
     sectionStart[i]=sectionLength*i;
     sectionEnd[i]=(sectionLength*(i+1))-DIVIDERS;
     sectionColor[i]=0;
     for(int f=0; f < SECTIONS; f++) {
-      sectionFlash[i]=0;
+      sectionEffect[i]=0;
     }
   }
   strip.begin();
   strip.setBrightness(255*(BRIGHTNESS/100.001));
   strip.show();
-#if STARTWITHSHOW == 1
-  doInitDisplay();
-#elif STARTWITHSHOW == 2
-  doInitColor();
-#else
-  initDividers();
-#endif
+  doInitEffect();
 }
 
 void loop() {
-#ifdef UART  
-  // see if there's incoming serial data:
-  if (Serial.available() > 0) {
-    // read the oldest byte in the serial buffer:
-    int incomingByte = Serial.read();
-    paramEval(incomingByte);
-  }
-#endif
-  delay(10);
-  doFlash();
+  doEffects();
   strip.show();
+  delay(10);
 }
 
-void doFlash() {
+void commProtocol(byte incomingByte) {
+  static word buffer;
+  if(incomingByte == 255) {
+    word section = (buffer >> 8) & 0x07;
+    word effect = (buffer >> 11) & 0x0F;
+    word data = buffer & 0x00FF;
+    paramEval(section, effect, data);
+  }
+  else
+    buffer = (buffer << 8) | incomingByte;
+}
+
+// This function always processes input for 5 input ranges/display sections
+// MAC: low priority: Look at pre-compile directives to only run the code for the defined number of sections
+void paramEval(word section, word effect, word color) {
+  // If we're doing a static color set, do that and reset the effect value to zero
+  // This reduces processing done during doEffects() which is executed frequently and needs to return as quickly as possible
+  switch(effect) {
+  case 0:
+    setSection(section, Wheel(color));
+    break;
+  case 1: 
+    setSection(section, Greyscale(color));
+    effect=0;
+    break;
+  case 4: 
+    setSection(section, RYG_Grad(color));
+    effect=0;
+    break;
+  case 5: 
+    setSection(section, MW_Grad(color));
+    effect=0;
+    break;
+  }
+  setEffect(section, effect, color);
+}
+
+void setSection (int section, uint32_t color) {
+  if (section == 7) // This means that we need to set all sections to the same color
+    for(byte i=0; i<SECTIONS; i++) setSection(i,color);
+    
+  if (section < SECTIONS) { // Don't do anything if we're told to affect a section that shouldn't exist
+    sectionColor[section]=color;
+    for(byte i=sectionStart[section]; i<sectionEnd[section]; i++) {
+      strip.setPixelColor(i, color);
+    }
+  }
+}
+
+void setEffect(word section, word effect, word data) {
+  if(section==7) {
+  }
+  sectionEffect[section]=effect;
+  sectionColor[section]=data;
+  lastEffectStep[section]=0;
+}
+
+void doEffects() {
   unsigned long now=millis();
-  if (now-lastFlashCheck[FLASHTYPES+1][0] < 100) return;
+  if (now-lastEffectStep[0] < 100) return;
 
   for(int i=0; i < SECTIONS; i++) {
-    if(CHECK_BIT(sectionFlash[i],0)) {
-      if(now-lastFlashCheck[0][i] >= 250) {
+    if(CHECK_BIT(sectionEffect[i],0)) {
+      if(now-lastEffectStep[i] >= 250) {
         toggleBrightness(i);
-        lastFlashCheck[0][i]=now;
+        lastEffectStep[i]=now;
         Serial.print("FT0 ");
-        Serial.println(i);f
+        Serial.println(i);
       }
     }
-    else if(CHECK_BIT(sectionFlash[i],1)) {
-      if(now-lastFlashCheck[1][i] >= 500) {
+    else if(CHECK_BIT(sectionEffect[i],1)) {
+      if(now-lastEffectStep[i] >= 500) {
         toggleBrightness(i);      
-        lastFlashCheck[1][i]=now;
+        lastEffectStep[i]=now;
         Serial.print("FT1 ");
         Serial.println(i);
       }
     }
-    else if(CHECK_BIT(sectionFlash[i],2)) {
-      if(now-lastFlashCheck[2][i] >= 1000) {
+    else if(CHECK_BIT(sectionEffect[i],2)) {
+      if(now-lastEffectStep[i] >= 1000) {
         // zipStep(i);
-        lastFlashCheck[2][i]=now;
+        lastEffectStep[i]=now;
         Serial.print("FT2 ");
         Serial.println(i);
       }
@@ -225,107 +287,19 @@ void doFlash() {
 
 void toggleBrightness(int section) {
   if((strip.getPixelColor(sectionStart[section]) & 0xFEFEFE) == (sectionColor[section] & 0xFEFEFE)) {
-    Serial.print("Got Here, cur color: ");
+/*    Serial.print("Got Here, cur color: ");
     Serial.print(strip.getPixelColor(sectionStart[section]),HEX);
     Serial.print(", expected color: ");
-    Serial.println(sectionColor[section],HEX);
+    Serial.println(sectionColor[section],HEX); */
     for(int i=sectionStart[section]; i < sectionEnd[section]; i++) 
       strip.setPixelColor(i,0);
   } else {
-    Serial.print("Got There, cur color: ");
+/*    Serial.print("Got There, cur color: ");
     Serial.print(strip.getPixelColor(sectionStart[section]),HEX);
     Serial.print(", expected color: ");
-    Serial.println(sectionColor[section],HEX);
+    Serial.println(sectionColor[section],HEX); */
     for(int i=sectionStart[section]; i < sectionEnd[section]; i++) 
       strip.setPixelColor(i,sectionColor[section]);
-  }
-}
-
-// This function always processes input for 5 input ranges/display sections
-// MAC: low priority: Look at pre-compile directives to only run the code for the defined number of sections
-void paramEval(int incomingByte) {
-  int section=9;
-  // Determine whether the input was in range and if so, what section should be affected by the input
-  // Also normalize it to a small integer to make easier determination of the color to be assigned
-  if ( incomingByte >= 48 && incomingByte <= 57 ) {  // ASCII range for numerals 0-9
-    incomingByte = incomingByte - 48;
-    section=0;
-  }
-  else if ( incomingByte >= 97 && incomingByte <= 109 ) { // ASCII range for lower-case letters a-m
-    incomingByte = incomingByte - 97;
-    section=1;
-  }
-  else if ( incomingByte >= 65 && incomingByte <= 77 ) {  // ASCII range for upper-case letters A-M
-    incomingByte = incomingByte - 65;
-    section=2;
-  }
-  else if ( incomingByte >= 110 && incomingByte <= 122 ) { // ASCII range for lower-case letters n-z
-    incomingByte = incomingByte - 110;
-    section=3;
-  }
-  else if ( incomingByte >= 78 && incomingByte <= 90 ) {  // ASCII range for upper-case letters N-Z
-    incomingByte = incomingByte - 78;
-    section=4;
-  }
-  // Figure out which color should be assigned and set the designated section to that color
-  switch(incomingByte) {
-  case 0:
-    setSection(section, COLOR0);
-    break;
-  case 1: 
-    setSection(section, COLOR1);
-    break;
-  case 2: 
-    setSection(section, COLOR2);
-    break;
-  case 3: 
-    setSection(section, COLOR3);
-    break;
-  case 4: 
-    setSection(section, COLOR4);
-    break;
-  case 5: 
-    setSection(section, COLOR5);
-    break;
-  case 6: 
-    setSection(section, COLOR6);
-    break;
-  case 7: 
-    setSection(section, COLOR7);
-    break;
-  case 8: 
-    setSection(section, COLOR8);
-    break;
-  case 9: 
-    setSection(section, COLOR9);
-    break;
-  case 10: 
-    sectionFlash[section]=TOGGLE_BIT(sectionFlash[section], 0);
-    setSection(section, COLOR1);
-    break;
-  case 11: 
-    sectionFlash[section]=TOGGLE_BIT(sectionFlash[section], 1);
-    setSection(section, COLOR2);
-    break;
-  case 12:
-    if (section == 4) { // This corresponds to a 'Z' character being received
-      dropInitDisplay=0;
-      doInitDisplay();
-    }
-    else {
-      sectionFlash[section]=TOGGLE_BIT(sectionFlash[section], 2);
-      setSection(section, COLOR3);
-    }
-    break;
-  }
-}
-
-void setSection (int section, uint32_t color) {
-  if (section < SECTIONS) { // Don't do anything if we're told to affect a section that shouldn't exist
-    sectionColor[section]=color;
-    for(uint16_t i=sectionStart[section]; i<sectionEnd[section]; i++) {
-      strip.setPixelColor(i, color);
-    }
   }
 }
 
@@ -334,12 +308,56 @@ void initDividers() {
     strip.setPixelColor(i, 0x000000); //Clears the strand to Black
   }
 #if DIVIDERS > 0
-  int sectionLength=(NPIXEL / SECTIONS);
   for(uint16_t i=0; i<SECTIONS; i++) {
     int dividerLoc=(sectionLength*(i+1))-1;
     strip.setPixelColor(dividerLoc, DIVIDERCOLOR);
   }
 #endif
+}
+// Input a value 0 to 254 to get an individual color back representing the position within the specified gradient
+
+// Gradient from Red to Green through Yellow (at midpoint)
+uint32_t RYG_Grad(byte index) {
+  if(index <= 127) {
+    return strip.Color(255            , index * 2, 0);
+  } else {
+    return strip.Color((255-index) * 2, 255      , 0);
+  }
+}
+
+// Gradient from Magenta to White
+uint32_t MW_Grad(byte index) {
+    return strip.Color(255, index, 255);
+}
+
+// Input a value 0 to 255 to get a color value.
+// The colours are a transition r - g - b - back to r.
+// Function borrowed from AdaFruit NeoPixel library examples
+uint32_t Wheel(byte WheelPos) {
+  WheelPos = 255 - WheelPos;
+  if(WheelPos < 85) {
+   return strip.Color(255 - WheelPos * 3, 0, WheelPos * 3);
+  } else if(WheelPos < 170) {
+    WheelPos -= 85;
+   return strip.Color(0, WheelPos * 3, 255 - WheelPos * 3);
+  } else {
+   WheelPos -= 170;
+   return strip.Color(WheelPos * 3, 255 - WheelPos * 3, 0);
+  }
+}
+
+// Input a value 0 to 254 to get a color value.
+// The colours are a transition black to full white.
+uint32_t Greyscale(byte index) {
+  if (index > 0) index++;
+  return strip.Color(index,index,index);
+}
+
+// Input a section and a index position and this produces a color rainbow in that section
+uint32_t doRainbow(word section, byte index) {
+  for(int i=sectionStart[section]; i < sectionEnd[section]; i++) {
+   strip.setPixelColor(i, Wheel(((i * 256 / sectionLength) + index) & 255));
+  }
 }
 
 ////////////////////////////////////////////////
@@ -351,21 +369,36 @@ void initDividers() {
 #ifdef I2C
 // function that executes whenever data is received from I2C master
 // this function is registered as an event, see setup()
-void receiveEvent(int howMany)
+void receiveI2cEvent(int howMany)
 {
-  if (! dropInitDisplay) {
+  if (! dropInitEffect) {
     initDividers();
   }
-  dropInitDisplay=1;
+  dropInitEffect=1;
   while(Wire.available()) // loop through all but the last
   {
-    int x = Wire.read(); // receive byte as a character
-    paramEval(x); 
+    int incomingByte = Wire.read(); // receive byte as a character
+    commProtocol(incomingByte); 
   }
 }
 #endif
 
-// Funcion to wipe whole string to a specified color
+#ifdef UART  
+void serialEvent() {
+  // see if there's incoming serial data:
+  if (! dropInitEffect) {
+    initDividers();
+  }
+  dropInitEffect=1;
+  if (Serial.available() > 0) {
+    // read the oldest byte in the serial buffer:
+    byte incomingByte = Serial.read();
+    commProtocol(incomingByte);
+  }
+}
+#endif
+
+// Function to wipe whole string to a specified color
 #if STARTWITHSHOW == 2
 void doInitColor() {
   for(int i=0; i<NPIXEL; i++) { // Sets whole LED strand to specified color
@@ -373,18 +406,9 @@ void doInitColor() {
   }
   strip.show();
   while(true) {
-#ifdef I2C
-    if (dropInitDisplay) {
+    if (dropInitEffect) {
       return;
     }
-#endif
-#ifdef UART
-    if (Serial.available() > 0) {
-      dropInitDisplay=1;
-      initDividers();
-      return;
-    }   
-#endif
     delay(50);
   }
 }
@@ -397,26 +421,26 @@ void doInitColor() {
 // 2=Cylon Eye effect going only one direction, then wrapping back to the start of the string
 // 3=Breathing effect using brightness increase/decrease and a single color
 
-#if IDLESHOW == 0
 
 // This is the code called when no Idle show/effect is desired
-void doInitDisplay() {
-  if (dropInitDisplay) { 
-    return; 
-  }
-  initDividers();
+void doInitEffect() {
+  setEffect(7,IDLESHOW,0);
+#if IDLESHOW == 0
+#elif IDLESHOW == 1
+#elif IDLESHOW == 2
+#elif IDLESHOW == 3  
+#endif
 }
 
 // End No effect/show
 
-#elif IDLESHOW == 1
 
 // This is the code for the bi-directional Cylon Eye effect
 // The eye runs from one end of the LED string to the other end, the runs in the opposite direction back to the starting end
 // Rinse and repeat
 // ... Think "Night Rider"
-void doInitDisplay() {
-  if (dropInitDisplay) { 
+void doEffectCylonEye() {
+  if (dropInitEffect) { 
     return; 
   }
   for(int i=0; i<NPIXEL; i++) {
@@ -424,18 +448,9 @@ void doInitDisplay() {
   }
   while(true) {
     for(int i=0; i<NPIXEL; i++) {
-#ifdef I2C
-      if (dropInitDisplay) {
+      if (dropInitEffect) {
         return;
       }
-#endif
-#ifdef UART
-      if (Serial.available() > 0) {
-        dropInitDisplay=1;
-        initDividers();
-        return;
-      }   
-#endif
       strip.setPixelColor(i+2, CYLONCOLOR2); 
       strip.setPixelColor(i+1, CYLONCOLOR2); //Second Dot Color
       strip.setPixelColor(i,   CYLONCOLOR1); //Center Dot Color
@@ -446,18 +461,9 @@ void doInitDisplay() {
       delay(CYLONSPEED);
     }
     for(int i=NPIXEL-1; i>0; i--) {
-#ifdef I2C
-      if (dropInitDisplay) { // When using I2C, the receiveEvent function tells us when to drop out
+      if (dropInitEffect) { // When using I2C, the receiveEvent function tells us when to drop out
         return;
       }
-#endif
-#ifdef UART
-      if (Serial.available() > 0) { // When using UART, check for input and drop out if any found
-        dropInitDisplay=1; // Remember that we did this
-        initDividers();
-        return;
-      }
-#endif
       strip.setPixelColor(i-2, CYLONCOLOR2); 
       strip.setPixelColor(i-1, CYLONCOLOR2); //Second Dot Color
       strip.setPixelColor(i,   CYLONCOLOR1); //Center Dot Color
@@ -472,7 +478,6 @@ void doInitDisplay() {
 
 // End bi-directional Cylon Eye effect
 
-#elif IDLESHOW == 2
 
 // This is the code for the looping Cylon Eye effect
 // The eye runs from one end of the LED string to the other end
@@ -480,8 +485,8 @@ void doInitDisplay() {
 // Rinse and repeat
 // ... If LED strip(s) are set on a single plane wrapping all the way around the robot, this produces an eye(s) that go all the way around the robot
 // ... Keep in mind that there will be as many eyes as you have non-daisy chained LED strips
-void doInitDisplay() {
-  if (dropInitDisplay) { 
+void doEffectChasingEye() {
+  if (dropInitEffect) { 
     return; 
   }
   for(int i=0; i<NPIXEL; i++) {
@@ -496,11 +501,9 @@ void doInitDisplay() {
         else {
           f=j;
         }
-#ifdef I2C
-        if (dropInitDisplay) { // When using I2C, the receiveEvent function tells us when to drop out
+        if (dropInitEffect) { // When using I2C, the receiveEvent function tells us when to drop out
           return;
         }
-#endif
         strip.setPixelColor(i+f, CYLONCOLOR2); //Second Dot Color
       }
       if (i >= NPIXEL) {
@@ -512,32 +515,23 @@ void doInitDisplay() {
       strip.setPixelColor(i-3, CYLONCOLOR3); //Clears the dots after the 3rd color
       strip.show();
       delay(CYLONSPEED);
-#ifdef I2C
-      if (dropInitDisplay) { // When using I2C, the receiveEvent function tells us when to drop out
+      if (dropInitEffect) { // When using I2C, the receiveEvent function tells us when to drop out
         return;
       }
-#endif
-#ifdef UART
-      if (Serial.available() > 0) { // When using UART, check for input and drop out if any found
-        dropInitDisplay=1; // Remember that we did this
-        initDividers();
-        return;
-      }
-#endif
     }
   }
 }
 
 // End looping Cylon Eye effect
 
-#elif IDLESHOW == 3
+
 
 // This is the code for the breathing effect
 // The LEDs are all set to half brightness and all the same color
 // The LEDs are slowly dimmed and brightened 
 // ... You get a gentle "breathing/snoring" effect similar to that sometimes seen on an LED in the sleep mode of a computer
-void doInitDisplay() {
-  if (dropInitDisplay) { 
+void doBreathingEffect() {
+  if (dropInitEffect) { 
     return; 
   }
   int brightness=BREATHMAXBRIGHTNESS;
@@ -545,7 +539,7 @@ void doInitDisplay() {
 
   strip.setBrightness(brightness);
   for(int i=0; i<NPIXEL; i++) {
-    if (dropInitDisplay) { 
+    if (dropInitEffect) { 
       return; 
     }
     strip.setPixelColor(i, BREATHCOLOR);
@@ -553,20 +547,10 @@ void doInitDisplay() {
 
   while(true) {
     strip.show();
-#ifdef I2C
-    if (dropInitDisplay) {
+    if (dropInitEffect) {
       strip.setBrightness(255*(BRIGHTNESS/100.001));
       return;
     }
-#endif
-#ifdef UART
-    if (Serial.available() > 0) {
-      dropInitDisplay=1;
-      initDividers();
-      strip.setBrightness(255*(BRIGHTNESS/100.001));
-      return;
-    }   
-#endif
     delay(BREATHSPEED);
     brightness=brightness+changeFactor;
     if (brightness > BREATHMAXBRIGHTNESS) {
@@ -580,20 +564,10 @@ void doInitDisplay() {
       strip.show();
       for (int j=0; j < BREATHLOWTIME; j+=20) {
         delay(20);
-#ifdef I2C
-        if (dropInitDisplay) {
+        if (dropInitEffect) {
           strip.setBrightness(255*(BRIGHTNESS/100.001));
           return;
         }
-#endif
-#ifdef UART
-        if (Serial.available() > 0) {
-          dropInitDisplay=1;
-          initDividers();
-          strip.setBrightness(255*(BRIGHTNESS/100.001));
-          return;
-        }   
-#endif
       }
     }
     strip.setBrightness(brightness);
@@ -602,7 +576,6 @@ void doInitDisplay() {
 
 // End breathing effect
 
-#endif
 
 
 
