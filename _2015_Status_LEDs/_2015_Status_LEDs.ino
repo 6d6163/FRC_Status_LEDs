@@ -79,10 +79,10 @@
 #define STARTWITHSHOW 0
 #define STARTCOLOR 0x00FFFF // Color to have all LEDs lit to upon boot (if set in STARTWITHSHOW) (default: Cyan)
 
-#define BRIGHTNESS 100 // Global brightness percentage (a lower the value is better on your battery but potentially harder to see)
+#define BRIGHTNESS 50 // Global brightness percentage (a lower the value is better on your battery but potentially harder to see)
 #define SECTIONS 3 // How many status display sections will be shown when not in initial display mode
 
-#define DIVIDERS 0 // Have white divider LEDs between status display sections? 1=yes, 0=no
+#define DIVIDERS 1 // Have white divider LEDs between status display sections? 1=yes, 0=no
 #define DIVIDERCOLOR 0x888888 // Color of the divider LEDs (default: mid brightness white)
 
 
@@ -96,7 +96,7 @@
 #define I2C_SLAVE_ADDR 0x10 // Ignored if I2C input isn't used
 
 // Tell me about your WS2812 light strip
-#define NPIXEL 10  // How many pixels on the LED strip
+#define NPIXEL 30  // How many pixels on the LED strip
 #define LED_PIN 6  // What Arduino pin is connected to the data line of the LED strip?
                    // This is always Pin 6 if using the LED header of the REX Robotics RioDuino.
 
@@ -107,6 +107,7 @@
 // 2=Cylon Eye effect going only one direction, then wrapping back to the start of the string
 // 3=Breathing effect using brightness increase/decrease and a single color
 #define IDLESHOW 1
+
 
 // Things that control the look of the Cylon Eye effects (ignored if Cylon effects not used)
 #define CYLONCOLOR1 0xFFFF00 // Center pixel color
@@ -136,18 +137,9 @@
 #ifdef I2C
 #include <Wire.h>
 #endif
-#define CHECK_BIT(var,pos) ((var) & (1<<(pos)))
-#define TOGGLE_BIT(var,pos) ((var) ^ (1<<(pos)))
-#define FLASHTYPES 3
 
 Adafruit_NeoPixel strip = Adafruit_NeoPixel(NPIXEL, LED_PIN, NEO_GRB + NEO_KHZ800);
 boolean dropInitDisplay=0;
-byte sectionFlash[SECTIONS];
-uint32_t sectionColor[SECTIONS];
-unsigned int sectionStart[SECTIONS];
-unsigned int sectionEnd[SECTIONS];
-unsigned int sectionLength=(NPIXEL / SECTIONS);
-unsigned long lastFlashCheck[FLASHTYPES+1][SECTIONS];
 
 void setup() {
 #ifdef UART
@@ -157,14 +149,6 @@ void setup() {
   Wire.begin(I2C_SLAVE_ADDR);
   Wire.onReceive(receiveEvent); // register event
 #endif
-  for(int i=0; i < SECTIONS; i++) {
-    sectionStart[i]=sectionLength*i;
-    sectionEnd[i]=(sectionLength*(i+1))-DIVIDERS;
-    sectionColor[i]=0;
-    for(int f=0; f < SECTIONS; f++) {
-      sectionFlash[i]=0;
-    }
-  }
   strip.begin();
   strip.setBrightness(255*(BRIGHTNESS/100.001));
   strip.show();
@@ -187,58 +171,7 @@ void loop() {
   }
 #endif
   delay(10);
-  doFlash();
   strip.show();
-}
-
-void doFlash() {
-  unsigned long now=millis();
-  if (now-lastFlashCheck[FLASHTYPES+1][0] < 100) return;
-
-  for(int i=0; i < SECTIONS; i++) {
-    if(CHECK_BIT(sectionFlash[i],0)) {
-      if(now-lastFlashCheck[0][i] >= 250) {
-        toggleBrightness(i);
-        lastFlashCheck[0][i]=now;
-        Serial.print("FT0 ");
-        Serial.println(i);f
-      }
-    }
-    else if(CHECK_BIT(sectionFlash[i],1)) {
-      if(now-lastFlashCheck[1][i] >= 500) {
-        toggleBrightness(i);      
-        lastFlashCheck[1][i]=now;
-        Serial.print("FT1 ");
-        Serial.println(i);
-      }
-    }
-    else if(CHECK_BIT(sectionFlash[i],2)) {
-      if(now-lastFlashCheck[2][i] >= 1000) {
-        // zipStep(i);
-        lastFlashCheck[2][i]=now;
-        Serial.print("FT2 ");
-        Serial.println(i);
-      }
-    }
-  }
-}
-
-void toggleBrightness(int section) {
-  if((strip.getPixelColor(sectionStart[section]) & 0xFEFEFE) == (sectionColor[section] & 0xFEFEFE)) {
-    Serial.print("Got Here, cur color: ");
-    Serial.print(strip.getPixelColor(sectionStart[section]),HEX);
-    Serial.print(", expected color: ");
-    Serial.println(sectionColor[section],HEX);
-    for(int i=sectionStart[section]; i < sectionEnd[section]; i++) 
-      strip.setPixelColor(i,0);
-  } else {
-    Serial.print("Got There, cur color: ");
-    Serial.print(strip.getPixelColor(sectionStart[section]),HEX);
-    Serial.print(", expected color: ");
-    Serial.println(sectionColor[section],HEX);
-    for(int i=sectionStart[section]; i < sectionEnd[section]; i++) 
-      strip.setPixelColor(i,sectionColor[section]);
-  }
 }
 
 // This function always processes input for 5 input ranges/display sections
@@ -299,22 +232,10 @@ void paramEval(int incomingByte) {
   case 9: 
     setSection(section, COLOR9);
     break;
-  case 10: 
-    sectionFlash[section]=TOGGLE_BIT(sectionFlash[section], 0);
-    setSection(section, COLOR1);
-    break;
-  case 11: 
-    sectionFlash[section]=TOGGLE_BIT(sectionFlash[section], 1);
-    setSection(section, COLOR2);
-    break;
   case 12:
     if (section == 4) { // This corresponds to a 'Z' character being received
       dropInitDisplay=0;
       doInitDisplay();
-    }
-    else {
-      sectionFlash[section]=TOGGLE_BIT(sectionFlash[section], 2);
-      setSection(section, COLOR3);
     }
     break;
   }
@@ -322,8 +243,10 @@ void paramEval(int incomingByte) {
 
 void setSection (int section, uint32_t color) {
   if (section < SECTIONS) { // Don't do anything if we're told to affect a section that shouldn't exist
-    sectionColor[section]=color;
-    for(uint16_t i=sectionStart[section]; i<sectionEnd[section]; i++) {
+    int sectionLength=(NPIXEL / SECTIONS);
+    int sectionStart=sectionLength*section;
+    int sectionEnd=(sectionLength*(section+1))-DIVIDERS;
+    for(uint16_t i=sectionStart; i<sectionEnd; i++) {
       strip.setPixelColor(i, color);
     }
   }
@@ -540,8 +463,8 @@ void doInitDisplay() {
   if (dropInitDisplay) { 
     return; 
   }
-  int brightness=BREATHMAXBRIGHTNESS;
-  int changeFactor=-1;
+  int brightness=64;
+  int changeFactor=1;
 
   strip.setBrightness(brightness);
   for(int i=0; i<NPIXEL; i++) {
